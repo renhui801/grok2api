@@ -2707,8 +2707,9 @@ func (a *teamModelRateLimitConsoleAdapter) ForwardResponse(_ context.Context, re
 		}, nil
 	}
 	return &provider.Response{
-		StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests", Header: http.Header{"Content-Type": {"application/json"}},
-		Body: io.NopCloser(strings.NewReader(`{"error":"team model rate limited"}`)),
+		StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests",
+		Header: http.Header{"Content-Type": {"application/json"}, "X-Should-Retry": {"false"}},
+		Body:   io.NopCloser(strings.NewReader(`{"error":"team model rate limited"}`)),
 		RateLimit: &provider.RateLimitMetadata{
 			Scope: provider.RateLimitScopeRPM, TeamID: request.Credential.TeamID, Model: request.Model,
 			Actual: 61, Limit: 60, RetryAfter: time.Hour,
@@ -3088,6 +3089,92 @@ func TestGatewayBuildTeamRPSRateLimitSwitchesTeam(t *testing.T) {
 	attempts := adapter.Attempts()
 	if len(attempts) != before+1 || attempts[len(attempts)-1] != credentials[2].ID {
 		t.Fatalf("cached Team X limit should go straight to Team Y, attempts=%#v", attempts)
+	}
+}
+
+func TestGatewayBuildTeamRPSRateLimitIgnoresUpstreamModelAlias(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "build-team-rps-alias.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	teamX := "00000000-0000-0000-0000-0000000000a1"
+	teamY := "00000000-0000-0000-0000-0000000000b2"
+	credentials := make([]account.Credential, 0, 3)
+	for index, seed := range []struct {
+		name   string
+		teamID string
+	}{{"build-alias-x-a", teamX}, {"build-alias-x-b", teamX}, {"build-alias-y-c", teamY}} {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderBuild, Name: seed.name, SourceKey: seed.name, TeamID: seed.teamID,
+			EncryptedAccessToken: "token-" + seed.name, ExpiresAt: time.Now().Add(time.Hour),
+			Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 300 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	model := "grok-build-team-alias"
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{model}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{model}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "team-alias-key", Prefix: "teamalias", SecretHash: strings.Repeat("7", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Upstream reports a different model identifier than the requested route.
+	limited := `{"code":"resource-exhausted","error":"Too many requests for team ` + teamX + ` and model grok-4.5-build-free. Requests per Second (actual/limit): 2/2."}`
+	adapter := &scriptedBuildAdapter{responses: map[uint64][]scriptedBuildResponse{
+		credentials[0].ID: {{status: http.StatusTooManyRequests, body: limited, header: http.Header{"X-Should-Retry": {"false"}}}},
+		credentials[1].ID: {{status: http.StatusOK, body: `{"id":"resp-should-skip-same-team"}`}},
+		credentials[2].ID: {{status: http.StatusOK, body: `{"id":"resp-team-y"}`}},
+	}}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-team-alias", ClientKey: clientKey, PublicModel: model,
+		Body: []byte(`{"model":"` + model + `","input":"hello"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", result.StatusCode)
+	}
+	result.Finalize(Usage{}, "resp-team-y", "")
+	_ = result.Body.Close()
+	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0] != credentials[0].ID || attempts[1] != credentials[2].ID {
+		t.Fatalf("aliased model 429 must still skip same-team B, attempts=%#v want A then C", attempts)
+	}
+	cooled, err := accountRepo.Get(ctx, credentials[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cooled.FailureCount != 0 || cooled.CooldownUntil != nil {
+		t.Fatalf("team rate limit must not cool the first account: %#v", cooled)
 	}
 }
 

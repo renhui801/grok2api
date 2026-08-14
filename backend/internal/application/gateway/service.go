@@ -196,6 +196,7 @@ type Service struct {
 	rateLimitNextExpiry         atomic.Int64
 	rateLimits                  map[string]teamModelRateLimit
 	rateLimitTeams              map[uint64]teamRateLimitObservation
+	rateLimitUnknownTeams       map[string]teamRateLimitObservation
 	modelSyncMu                 sync.Mutex
 	modelSyncing                map[uint64]struct{}
 	markBuildChatDeniedAsReauth atomic.Bool
@@ -237,6 +238,7 @@ func NewService(models routeResolver, audits auditRecorder, accounts *accountapp
 		models: models, audits: audits, accounts: accounts, clientKeys: clientKeys, providers: providers,
 		selector: selector, responses: responses, logger: slog.Default(),
 		rateLimits: make(map[string]teamModelRateLimit), rateLimitTeams: make(map[uint64]teamRateLimitObservation),
+		rateLimitUnknownTeams: make(map[string]teamRateLimitObservation),
 		modelSyncing: make(map[uint64]struct{}),
 	}
 	service.UpdateMaxAttempts(maxAttempts)
@@ -288,6 +290,36 @@ func teamModelRateLimitKey(providerValue accountdomain.Provider, teamFingerprint
 	return string(providerValue) + "\x00" + teamFingerprint + "\x00" + strings.TrimSpace(upstreamModel)
 }
 
+func unknownTeamModelKey(providerValue accountdomain.Provider, upstreamModel string) string {
+	return string(providerValue) + "\x00" + strings.TrimSpace(upstreamModel)
+}
+
+// teamRateLimitRetryWaitCap is long enough for xAI Team RPS windows (about 1s,
+// stored as 2s) and short enough that RPM/hour cooldowns still fail over.
+const teamRateLimitRetryWaitCap = 3 * time.Second
+
+func teamRateLimitRetryWait(until time.Time, now time.Time) (time.Duration, bool) {
+	wait := until.Sub(now)
+	if wait <= 0 || wait > teamRateLimitRetryWaitCap {
+		return wait, false
+	}
+	return wait, true
+}
+
+func waitForDuration(ctx context.Context, wait time.Duration) error {
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func rateLimitTeamFingerprint(teamID string) string {
 	teamID = strings.ToLower(strings.TrimSpace(teamID))
 	if teamID == "" {
@@ -318,6 +350,15 @@ func (s *Service) activeTeamModelRateLimit(credential accountdomain.Credential, 
 		s.pruneTeamModelRateLimitsLocked(now)
 		if len(s.rateLimits) == 0 {
 			return teamModelRateLimit{}, false
+		}
+	}
+	if credentialFingerprint == "" {
+		if observation, ok := s.rateLimitUnknownTeams[unknownTeamModelKey(credential.Provider, upstreamModel)]; ok {
+			if observation.Fingerprint != "" && now.Before(observation.ExpiresAt) {
+				credentialFingerprint = observation.Fingerprint
+			} else {
+				delete(s.rateLimitUnknownTeams, unknownTeamModelKey(credential.Provider, upstreamModel))
+			}
 		}
 	}
 	// Check the TeamID observed in an upstream response first, then current
@@ -365,12 +406,18 @@ func (s *Service) pruneTeamModelRateLimitsLocked(now time.Time) {
 			delete(s.rateLimitTeams, accountID)
 		}
 	}
+	for key, observation := range s.rateLimitUnknownTeams {
+		if !now.Before(observation.ExpiresAt) {
+			delete(s.rateLimitUnknownTeams, key)
+		}
+	}
 	s.refreshTeamModelRateLimitStateLocked()
 }
 
 func (s *Service) refreshTeamModelRateLimitStateLocked() {
 	if len(s.rateLimits) == 0 {
 		clear(s.rateLimitTeams)
+		clear(s.rateLimitUnknownTeams)
 		s.rateLimitNextExpiry.Store(0)
 		s.rateLimitActive.Store(false)
 		return
@@ -382,6 +429,11 @@ func (s *Service) refreshTeamModelRateLimitStateLocked() {
 		}
 	}
 	for _, observation := range s.rateLimitTeams {
+		if nextExpiry.IsZero() || observation.ExpiresAt.Before(nextExpiry) {
+			nextExpiry = observation.ExpiresAt
+		}
+	}
+	for _, observation := range s.rateLimitUnknownTeams {
 		if nextExpiry.IsZero() || observation.ExpiresAt.Before(nextExpiry) {
 			nextExpiry = observation.ExpiresAt
 		}
@@ -412,10 +464,19 @@ func (s *Service) markTeamModelRateLimit(credential accountdomain.Credential, up
 	if s.rateLimitTeams == nil {
 		s.rateLimitTeams = make(map[uint64]teamRateLimitObservation)
 	}
+	if s.rateLimitUnknownTeams == nil {
+		s.rateLimitUnknownTeams = make(map[string]teamRateLimitObservation)
+	}
 	if teamFingerprint != rateLimitTeamFingerprint(credential.TeamID) {
 		s.rateLimitTeams[credential.ID] = teamRateLimitObservation{Fingerprint: teamFingerprint, ExpiresAt: until}
 	} else {
 		delete(s.rateLimitTeams, credential.ID)
+	}
+	if strings.TrimSpace(credential.TeamID) == "" && teamFingerprint != "" {
+		unknownKey := unknownTeamModelKey(credential.Provider, upstreamModel)
+		if current, ok := s.rateLimitUnknownTeams[unknownKey]; !ok || current.ExpiresAt.Before(until) {
+			s.rateLimitUnknownTeams[unknownKey] = teamRateLimitObservation{Fingerprint: teamFingerprint, ExpiresAt: until}
+		}
 	}
 	for existingKey, value := range s.rateLimits {
 		if !now.Before(value.Until) {
@@ -425,6 +486,11 @@ func (s *Service) markTeamModelRateLimit(credential accountdomain.Credential, up
 	for accountID, observation := range s.rateLimitTeams {
 		if !now.Before(observation.ExpiresAt) {
 			delete(s.rateLimitTeams, accountID)
+		}
+	}
+	for unknownKey, observation := range s.rateLimitUnknownTeams {
+		if !now.Before(observation.ExpiresAt) {
+			delete(s.rateLimitUnknownTeams, unknownKey)
 		}
 	}
 	if current, ok := s.rateLimits[key]; ok && !current.Until.Before(until) {

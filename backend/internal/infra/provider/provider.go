@@ -30,6 +30,29 @@ type HTTPStatusError interface {
 	HTTPStatusCode() int
 }
 
+// RetryAfterError preserves a safe upstream retry delay when an adapter cannot
+// return a Response, for example when a WebSocket handshake is rejected.
+type RetryAfterError interface {
+	error
+	RetryAfterDuration() time.Duration
+}
+
+// RequestScopedError marks an upstream rejection that retrying with another
+// account or egress cannot resolve.
+type RequestScopedError interface {
+	error
+	RequestScopedFailure() bool
+}
+
+// PublicMessageError exposes a deliberately sanitized message that may cross
+// the public API boundary. Provider errors must opt in; arbitrary Error()
+// strings can contain upstream response bodies, tokens, cookies, or request
+// diagnostics and therefore are never returned to clients by default.
+type PublicMessageError interface {
+	error
+	PublicErrorMessage() string
+}
+
 // ErrorHTTPStatus extracts the upstream HTTP status from a Provider error chain.
 func ErrorHTTPStatus(err error) (int, bool) {
 	var statusError HTTPStatusError
@@ -38,6 +61,137 @@ func ErrorHTTPStatus(err error) (int, bool) {
 	}
 	status := statusError.HTTPStatusCode()
 	return status, status > 0
+}
+
+// VideoStage identifies which phase of an asynchronous video job failed.
+type VideoStage string
+
+const (
+	// VideoStagePrepare is local work performed before the create request is sent.
+	// It is not account-failover eligible because retrying deterministic local
+	// validation or configuration failures against another credential is useless.
+	VideoStagePrepare VideoStage = "prepare"
+	// VideoStageCreate means the upstream explicitly rejected the create request.
+	// Account failover is safe only for the retryable 4xx statuses selected by
+	// the gateway; 5xx responses remain indeterminate because work may already
+	// have been accepted before the server failed.
+	VideoStageCreate VideoStage = "create"
+	// VideoStageSubmitted means the create request may have reached upstream but
+	// no usable job identifier was obtained. Retrying could duplicate work.
+	VideoStageSubmitted VideoStage = "submitted"
+	VideoStagePoll      VideoStage = "poll"
+)
+
+// VideoStageError records the asynchronous video phase without treating every
+// create-path error as safe for account failover.
+type VideoStageError struct {
+	Stage  VideoStage
+	Status int
+	Err    error
+}
+
+func (e *VideoStageError) Error() string {
+	if e == nil {
+		return "video request failed"
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	if e.Status > 0 {
+		return fmt.Sprintf("video %s failed with status %d", e.Stage, e.Status)
+	}
+	return fmt.Sprintf("video %s failed", e.Stage)
+}
+
+func (e *VideoStageError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *VideoStageError) HTTPStatusCode() int {
+	if e == nil {
+		return 0
+	}
+	if e.Status > 0 {
+		return e.Status
+	}
+	return ErrorHTTPStatusOrZero(e.Err)
+}
+
+// ErrorHTTPStatusOrZero extracts an upstream status or returns 0.
+func ErrorHTTPStatusOrZero(err error) int {
+	status, ok := ErrorHTTPStatus(err)
+	if !ok {
+		return 0
+	}
+	return status
+}
+
+// VideoErrorStage reports the video phase for an error chain.
+func VideoErrorStage(err error) (VideoStage, bool) {
+	var stageErr *VideoStageError
+	if !errors.As(err, &stageErr) || stageErr == nil || stageErr.Stage == "" {
+		return "", false
+	}
+	return stageErr.Stage, true
+}
+
+// VideoCreateFailureStage distinguishes an explicit upstream rejection from an
+// indeterminate POST result. Explicit 4xx responses (including the 401
+// sentinel) are rejections; transport errors and 5xx responses remain
+// submitted because the upstream may already have accepted the job.
+func VideoCreateFailureStage(err error) VideoStage {
+	if errors.Is(err, ErrUnauthorized) {
+		return VideoStageCreate
+	}
+	if status, ok := ErrorHTTPStatus(err); ok && status >= http.StatusBadRequest && status < http.StatusInternalServerError {
+		return VideoStageCreate
+	}
+	return VideoStageSubmitted
+}
+
+// WrapVideoStage annotates err with the video phase and optional HTTP status.
+func WrapVideoStage(stage VideoStage, status int, err error) error {
+	if err == nil {
+		return nil
+	}
+	var existing *VideoStageError
+	if errors.As(err, &existing) {
+		return err
+	}
+	if status <= 0 {
+		status = ErrorHTTPStatusOrZero(err)
+	}
+	return &VideoStageError{Stage: stage, Status: status, Err: err}
+}
+
+// ErrorRetryAfter extracts a positive retry delay from an error chain.
+func ErrorRetryAfter(err error) time.Duration {
+	var retryError RetryAfterError
+	if !errors.As(err, &retryError) {
+		return 0
+	}
+	return max(0, retryError.RetryAfterDuration())
+}
+
+// IsRequestScopedError reports whether the Provider has positively classified
+// the failure as request-scoped.
+func IsRequestScopedError(err error) bool {
+	var requestError RequestScopedError
+	return errors.As(err, &requestError) && requestError.RequestScopedFailure()
+}
+
+// ErrorPublicMessage extracts a message that the Provider has explicitly
+// classified as safe for clients.
+func ErrorPublicMessage(err error) (string, bool) {
+	var publicError PublicMessageError
+	if !errors.As(err, &publicError) {
+		return "", false
+	}
+	message := strings.TrimSpace(publicError.PublicErrorMessage())
+	return message, message != ""
 }
 
 // MediaPostProcessingStage identifies a local processing stage that failed after media generation.
@@ -240,6 +394,17 @@ type QuotaSnapshot struct {
 	SyncedAt time.Time
 }
 
+// QuotaGroupSnapshot is an authoritative snapshot for a group of quota modes
+// returned by one upstream request. Modes lists the complete local scope so
+// callers can atomically remove products that the upstream explicitly reports
+// as unavailable without touching unrelated quota windows.
+type QuotaGroupSnapshot struct {
+	Group    string
+	Modes    []string
+	Windows  []account.QuotaWindow
+	SyncedAt time.Time
+}
+
 type ImageGenerationRequest struct {
 	Credential     account.Credential
 	Model          string
@@ -248,6 +413,7 @@ type ImageGenerationRequest struct {
 	Size           string
 	AspectRatio    string
 	Resolution     string
+	Quality        string
 	ResponseFormat string
 	Streaming      bool
 	PartialImages  int
@@ -268,10 +434,20 @@ type ImageEditRequest struct {
 	Size           string
 	AspectRatio    string
 	Resolution     string
+	Quality        string
 	ResponseFormat string
 	Streaming      bool
 	PartialImages  int
 }
+
+// VideoOperation selects the official xAI video endpoint family.
+type VideoOperation = media.VideoOperation
+
+const (
+	VideoOperationGenerate = media.VideoOperationGenerate
+	VideoOperationEdit     = media.VideoOperationEdit
+	VideoOperationExtend   = media.VideoOperationExtend
+)
 
 type VideoRequest struct {
 	Credential account.Credential
@@ -281,16 +457,24 @@ type VideoRequest struct {
 	JobID string
 	// Model is the selected upstream video model when the Provider supports more than one.
 	Model string
-	Prompt        string
-	Duration      int
-	AspectRatio   string
-	Resolution    string
+	// Operation defaults to generate when empty.
+	Operation   VideoOperation
+	Prompt      string
+	Duration    int
+	AspectRatio string
+	Resolution  string
 	// ImageURL is the optional first-frame image (official "image" field).
 	ImageURL string
 	// ReferenceURLs are style/content references (official "reference_images").
 	// A single reference must stay in reference_images and must not be coerced to image.
+	// Official docs forbid combining image with reference_images.
 	ReferenceURLs []string
-	Progress      func(int)
+	// ReferenceAudios are preset voice_ids for reference-to-video (official "reference_audios").
+	// At most 3 entries; may be used alone or with reference_images.
+	ReferenceAudios []string
+	// VideoURL is required for edit/extend (official "video" field).
+	VideoURL string
+	Progress func(int)
 }
 
 type VideoResult struct {
@@ -307,16 +491,16 @@ type TTSOutputFormat struct {
 }
 
 type TTSRequest struct {
-	Credential                account.Credential
-	Model                     string
-	Text                      string
-	VoiceID                   string
-	Language                  string
-	OutputFormat              TTSOutputFormat
-	Speed                     float64
-	OptimizeStreamingLatency  int
-	TextNormalization         bool
-	WithTimestamps            bool
+	Credential               account.Credential
+	Model                    string
+	Text                     string
+	VoiceID                  string
+	Language                 string
+	OutputFormat             TTSOutputFormat
+	Speed                    float64
+	OptimizeStreamingLatency int
+	TextNormalization        bool
+	WithTimestamps           bool
 }
 
 type TTSTimestampSpan struct {
@@ -383,63 +567,6 @@ type VoiceInfo struct {
 	VoiceID  string
 	Name     string
 	Language string
-}
-
-type CustomVoice struct {
-	VoiceID   string
-	Name      string
-	Language  string
-	Gender    string
-	Tone      string
-	UseCase   string
-	CreatedAt string
-	UpdatedAt string
-	RawJSON   []byte
-}
-
-type CustomVoiceCreateRequest struct {
-	Credential account.Credential
-	Name       string
-	Language   string
-	Gender     string
-	Tone       string
-	UseCase    string
-	FileName   string
-	FileMIME   string
-	FileData   []byte
-}
-
-type CustomVoiceUpdateRequest struct {
-	Credential account.Credential
-	VoiceID    string
-	Name       *string
-	Language   *string
-	Gender     *string
-	Tone       *string
-	UseCase    *string
-}
-
-type RealtimeClientSecretRequest struct {
-	Credential    account.Credential
-	Model         string
-	ExpiresAfter  int
-	SessionJSON   []byte
-}
-
-type RealtimeClientSecretResult struct {
-	Value     string
-	ExpiresAt int64
-	RawJSON   []byte
-}
-
-type VoiceProxyRequest struct {
-	Credential  account.Credential
-	Method      string
-	Path        string
-	Query       string
-	Body        []byte
-	ContentType string
-	Accept      string
 }
 
 // RefreshedCredential represents rotated credentials returned by an OAuth refresh.
@@ -535,6 +662,20 @@ type QuotaAdapter interface {
 	SyncQuotaMode(ctx context.Context, credential account.Credential, mode string) (account.QuotaWindow, error)
 }
 
+// QuotaGroupAdapter is optional. It is used when one upstream endpoint returns
+// several related quota products as one authoritative response.
+type QuotaGroupAdapter interface {
+	Adapter
+	SyncQuotaGroup(ctx context.Context, credential account.Credential, group string) (QuotaGroupSnapshot, error)
+}
+
+// QuotaRefreshMetadataAdapter maps a model to an internal refresh group. The
+// group is scheduling metadata, not a routable quota mode.
+type QuotaRefreshMetadataAdapter interface {
+	Adapter
+	QuotaRefreshGroup(upstreamModel string) string
+}
+
 // WebAccountSettingsAdapter defines upstream profile-setting capabilities for Grok Web SSO accounts.
 // This capability belongs only to the Web Provider; Build and Console must not emulate it through generic account logic.
 type WebAccountSettingsAdapter interface {
@@ -588,26 +729,19 @@ type STTAdapter interface {
 	TranscribeSpeech(ctx context.Context, request STTRequest) (STTResult, error)
 }
 
-// RealtimeVoiceAdapter issues ephemeral secrets and can proxy websocket sessions.
-type RealtimeVoiceAdapter interface {
-	Adapter
-	CreateRealtimeClientSecret(ctx context.Context, request RealtimeClientSecretRequest) (RealtimeClientSecretResult, error)
-	RealtimeWebSocketURL(model string, query string) (string, error)
-}
-
 // VoiceWebSocketConn is a minimal duplex websocket used by voice streaming proxies.
 type VoiceWebSocketConn interface {
 	ReadMessage() (messageType int, data []byte, err error)
 	WriteMessage(messageType int, data []byte) error
+	SetReadLimit(limit int64)
 	Close() error
 }
 
 // VoiceWebSocketRequest dials an upstream voice websocket with provider auth.
 type VoiceWebSocketRequest struct {
 	Credential account.Credential
-	// Path is a v1-relative path such as /realtime, /tts, or /stt.
+	// Path is a v1-relative path such as /realtime or /stt.
 	Path  string
-	Query string
 	Model string
 }
 
@@ -615,23 +749,6 @@ type VoiceWebSocketRequest struct {
 type VoiceWebSocketAdapter interface {
 	Adapter
 	DialVoiceWebSocket(ctx context.Context, request VoiceWebSocketRequest) (VoiceWebSocketConn, func(), error)
-}
-
-// CustomVoiceAdapter manages team-scoped cloned voices.
-type CustomVoiceAdapter interface {
-	Adapter
-	CreateCustomVoice(ctx context.Context, request CustomVoiceCreateRequest) (CustomVoice, error)
-	ListCustomVoices(ctx context.Context, credential account.Credential, limit int, paginationToken string) ([]CustomVoice, string, error)
-	GetCustomVoice(ctx context.Context, credential account.Credential, voiceID string) (CustomVoice, error)
-	UpdateCustomVoice(ctx context.Context, request CustomVoiceUpdateRequest) (CustomVoice, error)
-	DeleteCustomVoice(ctx context.Context, credential account.Credential, voiceID string) error
-	GetCustomVoiceAudio(ctx context.Context, credential account.Credential, voiceID string) ([]byte, string, error)
-}
-
-// VoiceProxyAdapter forwards arbitrary official voice REST resources with account auth.
-type VoiceProxyAdapter interface {
-	Adapter
-	ProxyVoice(ctx context.Context, request VoiceProxyRequest) (*Response, error)
 }
 
 type RoutingMetadataAdapter interface {
@@ -826,18 +943,8 @@ func (r *Registry) Validate() error {
 			}
 		}
 		if definition.Media.Realtime {
-			if _, ok := adapter.(RealtimeVoiceAdapter); !ok {
-				return fmt.Errorf("Provider %s 声明实时语音能力但未实现适配器", value)
-			}
-		}
-		if definition.Media.TTS || definition.Media.STT || definition.Media.Realtime {
 			if _, ok := adapter.(VoiceWebSocketAdapter); !ok {
-				return fmt.Errorf("Provider %s 声明语音能力但未实现 WebSocket 适配器", value)
-			}
-		}
-		if definition.Media.CustomVoices {
-			if _, ok := adapter.(CustomVoiceAdapter); !ok {
-				return fmt.Errorf("Provider %s 声明自定义音色能力但未实现适配器", value)
+				return fmt.Errorf("Provider %s 声明实时语音能力但未实现 WebSocket 适配器", value)
 			}
 		}
 	}
@@ -982,6 +1089,15 @@ func (r *Registry) Quota(value account.Provider) (QuotaAdapter, bool) {
 	return result, ok
 }
 
+func (r *Registry) QuotaGroup(value account.Provider) (QuotaGroupAdapter, bool) {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return nil, false
+	}
+	result, ok := adapter.(QuotaGroupAdapter)
+	return result, ok
+}
+
 // WebAccountSettings returns the Grok Web-specific account profile settings capability.
 func (r *Registry) WebAccountSettings() (WebAccountSettingsAdapter, bool) {
 	adapter, ok := r.Get(account.ProviderWeb)
@@ -1002,6 +1118,18 @@ func (r *Registry) QuotaMode(value account.Provider, upstreamModel string) strin
 		return ""
 	}
 	return metadata.QuotaMode(upstreamModel)
+}
+
+func (r *Registry) QuotaRefreshGroup(value account.Provider, upstreamModel string) string {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return ""
+	}
+	metadata, ok := adapter.(QuotaRefreshMetadataAdapter)
+	if !ok {
+		return ""
+	}
+	return metadata.QuotaRefreshGroup(upstreamModel)
 }
 
 func (r *Registry) TierOrder(value account.Provider, upstreamModel string) []account.WebTier {
@@ -1078,39 +1206,12 @@ func (r *Registry) STT(value account.Provider) (STTAdapter, bool) {
 	return result, ok
 }
 
-func (r *Registry) RealtimeVoice(value account.Provider) (RealtimeVoiceAdapter, bool) {
-	adapter, ok := r.Get(value)
-	if !ok {
-		return nil, false
-	}
-	result, ok := adapter.(RealtimeVoiceAdapter)
-	return result, ok
-}
-
 func (r *Registry) VoiceWebSocket(value account.Provider) (VoiceWebSocketAdapter, bool) {
 	adapter, ok := r.Get(value)
 	if !ok {
 		return nil, false
 	}
 	result, ok := adapter.(VoiceWebSocketAdapter)
-	return result, ok
-}
-
-func (r *Registry) CustomVoices(value account.Provider) (CustomVoiceAdapter, bool) {
-	adapter, ok := r.Get(value)
-	if !ok {
-		return nil, false
-	}
-	result, ok := adapter.(CustomVoiceAdapter)
-	return result, ok
-}
-
-func (r *Registry) VoiceProxy(value account.Provider) (VoiceProxyAdapter, bool) {
-	adapter, ok := r.Get(value)
-	if !ok {
-		return nil, false
-	}
-	result, ok := adapter.(VoiceProxyAdapter)
 	return result, ok
 }
 

@@ -34,6 +34,8 @@ import { cn } from "@/shared/lib/cn";
 import { formatDateTime } from "@/shared/lib/format";
 import { nextTableSort, type SortOrder, type TableSort } from "@/shared/lib/table-sort";
 
+const modelSyncToastID = "model-sync-progress";
+
 export function ModelsPage() {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
@@ -135,14 +137,21 @@ export function ModelsPage() {
   });
 
   const syncMutation = useMutation({
-    mutationFn: syncModels,
+    mutationFn: () => syncModels((progress) => {
+      toast.loading(t("models.syncingProgress", progress), { id: modelSyncToastID });
+    }),
+    onMutate: () => {
+      toast.loading(t("models.syncing"), { id: modelSyncToastID });
+    },
     onSuccess: (result) => {
       setSelected(new Set());
       setPage(1);
       void queryClient.invalidateQueries({ queryKey: ["models"] });
-      toast.success(t("models.synced", { count: result.synced }));
+      toast.success(t("models.synced", { count: result.synced }), { id: modelSyncToastID });
     },
-    onError: showError,
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : t("errors.generic"), { id: modelSyncToastID });
+    },
   });
 
   function showError(error: unknown): void {
@@ -475,7 +484,7 @@ const endpointCapabilityMetadata = {
   video: { icon: Clapperboard, method: "POST", path: "/v1/videos/generations", color: "text-rose-600 dark:text-rose-400" },
   tts: { icon: AudioLines, method: "POST", path: "/v1/tts", color: "text-cyan-700 dark:text-cyan-400" },
   stt: { icon: Mic, method: "POST", path: "/v1/stt", color: "text-teal-700 dark:text-teal-400" },
-  realtime: { icon: Radio, method: "POST", path: "/v1/realtime/client_secrets", color: "text-sky-700 dark:text-sky-400" },
+  realtime: { icon: Radio, method: "GET", path: "/v1/realtime", color: "text-sky-700 dark:text-sky-400" },
 } as const;
 
 type ModelRouteGroup = {

@@ -171,8 +171,8 @@ func TestBuildVideoCreatePayloadMapsMultipleReferences(t *testing.T) {
 	}
 }
 
-func TestBuildVideoCreatePayloadKeepsImageAndReferences(t *testing.T) {
-	payload, err := videoCreatePayload(provider.VideoRequest{
+func TestBuildVideoCreatePayloadRejectsImageWithReferences(t *testing.T) {
+	_, err := videoCreatePayload(provider.VideoRequest{
 		Prompt:        "animate",
 		Duration:      6,
 		AspectRatio:   "16:9",
@@ -180,16 +180,33 @@ func TestBuildVideoCreatePayloadKeepsImageAndReferences(t *testing.T) {
 		ImageURL:      "https://cdn.example.com/first-frame.png",
 		ReferenceURLs: []string{"https://cdn.example.com/ref.png"},
 	}, "", buildVideoRequestProfile)
+	if err == nil {
+		t.Fatal("expected image+reference_images combination to fail")
+	}
+}
+
+func TestBuildVideoCreatePayloadReferenceAudios(t *testing.T) {
+	payload, err := videoCreatePayload(provider.VideoRequest{
+		Prompt:          "speak",
+		Duration:        8,
+		AspectRatio:     "9:16",
+		Resolution:      "720p",
+		ReferenceURLs:   []string{"https://cdn.example.com/person.png"},
+		ReferenceAudios: []string{"eve"},
+	}, "", buildVideoRequestProfile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	image, ok := payload["image"].(map[string]any)
-	if !ok || image["image_url"] != "https://cdn.example.com/first-frame.png" {
+	if _, exists := payload["image"]; exists {
 		t.Fatalf("image = %#v", payload["image"])
 	}
 	references, ok := payload["reference_images"].([]map[string]any)
-	if !ok || len(references) != 1 || references[0]["image_url"] != "https://cdn.example.com/ref.png" {
+	if !ok || len(references) != 1 || references[0]["image_url"] != "https://cdn.example.com/person.png" {
 		t.Fatalf("reference_images = %#v", payload["reference_images"])
+	}
+	audios, ok := payload["reference_audios"].([]map[string]any)
+	if !ok || len(audios) != 1 || audios[0]["voice_id"] != "eve" {
+		t.Fatalf("reference_audios = %#v", payload["reference_audios"])
 	}
 }
 
@@ -586,6 +603,57 @@ func TestGenerateVideoRespectsContextCancelDuringPoll(t *testing.T) {
 	})
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancel err = %v", err)
+	}
+}
+
+func TestBuildVideoCreateFailureStagesPreserveRetrySafety(t *testing.T) {
+	tests := []struct {
+		name      string
+		transport func(*http.Request) (*http.Response, error)
+		wantStage provider.VideoStage
+	}{
+		{
+			name: "transport result unknown",
+			transport: func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("connection reset after request write")
+			},
+			wantStage: provider.VideoStageSubmitted,
+		},
+		{
+			name: "malformed successful response",
+			transport: func(request *http.Request) (*http.Response, error) {
+				return jsonResponse(http.StatusOK, `{"status":"queued"}`, request), nil
+			},
+			wantStage: provider.VideoStageSubmitted,
+		},
+		{
+			name: "explicit rate limit rejection",
+			transport: func(request *http.Request) (*http.Response, error) {
+				return jsonResponse(http.StatusTooManyRequests, `{"error":"rate limited"}`, request), nil
+			},
+			wantStage: provider.VideoStageCreate,
+		},
+		{
+			name: "server failure result unknown",
+			transport: func(request *http.Request) (*http.Response, error) {
+				return jsonResponse(http.StatusInternalServerError, `{"error":"failed"}`, request), nil
+			},
+			wantStage: provider.VideoStageSubmitted,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			adapter, encrypted := newTestBuildVideoAdapter(t)
+			adapter.http.Transport = roundTripFunc(test.transport)
+			_, err := adapter.GenerateVideo(context.Background(), provider.VideoRequest{
+				Credential: account.Credential{ID: 1, Provider: account.ProviderBuild, EncryptedAccessToken: encrypted},
+				Prompt:     "test", Duration: 5,
+			})
+			stage, ok := provider.VideoErrorStage(err)
+			if !ok || stage != test.wantStage {
+				t.Fatalf("stage = %q, ok=%t, err=%v; want %q", stage, ok, err, test.wantStage)
+			}
+		})
 	}
 }
 

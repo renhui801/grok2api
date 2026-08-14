@@ -96,7 +96,8 @@ const endpoints: Record<string, EndpointDefinition> = {
       { name: "prompt", required: true, descriptionKey: "docs.reference.fieldPrompt" },
       { name: "n", descriptionKey: "docs.reference.fieldImageCount" },
       { name: "aspect_ratio", descriptionKey: "docs.reference.fieldAspectRatio" },
-      { name: "resolution", descriptionKey: "docs.reference.fieldResolution" },
+      { name: "resolution", descriptionKey: "docs.reference.fieldImageResolution" },
+      { name: "quality", descriptionKey: "docs.reference.fieldQuality" },
       { name: "response_format", descriptionKey: "docs.reference.fieldResponseFormat" },
       { name: "stream", descriptionKey: "docs.reference.fieldImageStream" },
     ],
@@ -112,6 +113,7 @@ const endpoints: Record<string, EndpointDefinition> = {
       { name: "prompt", required: true, descriptionKey: "docs.reference.fieldPrompt" },
       { name: "image / images", required: true, descriptionKey: "docs.reference.fieldEditImages" },
       { name: "n", descriptionKey: "docs.reference.fieldImageCount" },
+      { name: "quality", descriptionKey: "docs.reference.fieldQuality" },
       { name: "response_format", descriptionKey: "docs.reference.fieldResponseFormat" },
     ],
     noteKeys: ["docs.reference.noteEditJSON", "docs.reference.noteEditSources", "docs.reference.noteImageStorage"],
@@ -126,13 +128,39 @@ const endpoints: Record<string, EndpointDefinition> = {
       { name: "prompt", descriptionKey: "docs.reference.fieldVideoPrompt" },
       { name: "duration", descriptionKey: "docs.reference.fieldDuration" },
       { name: "aspect_ratio", descriptionKey: "docs.reference.fieldAspectRatio" },
-      { name: "resolution", descriptionKey: "docs.reference.fieldResolution" },
+      { name: "resolution", descriptionKey: "docs.reference.fieldVideoResolution" },
       { name: "image", descriptionKey: "docs.reference.fieldVideoImage" },
       { name: "reference_images", descriptionKey: "docs.reference.fieldReferenceImages" },
+      { name: "reference_audios", descriptionKey: "docs.reference.fieldReferenceAudios" },
     ],
-    noteKeys: ["docs.reference.noteVideoAsync", "docs.reference.noteVideoStrict"],
+    noteKeys: ["docs.reference.noteVideoAsync", "docs.reference.noteVideoReference", "docs.reference.noteVideoStrict"],
     request: (model) => ({ model, prompt: "A paper airplane flying over a city", duration: 8, aspect_ratio: "16:9", resolution: "720p" }),
     response: { request_id: "video_example" },
+  },
+  "video/edits": {
+    key: "video/edits", category: "Video", title: "Video edits", method: "POST", path: "/videos/edits",
+    descriptionKey: "docs.endpointVideoEdit", capabilities: ["video"],
+    fields: [
+      { name: "model", required: true, descriptionKey: "docs.reference.fieldModel" },
+      { name: "prompt", required: true, descriptionKey: "docs.reference.fieldVideoEditPrompt" },
+      { name: "video", required: true, descriptionKey: "docs.reference.fieldVideoInput" },
+    ],
+    noteKeys: ["docs.reference.noteVideoAsync", "docs.reference.noteVideoEditModel", "docs.reference.noteVideoBilling", "docs.reference.noteVideoStrict"],
+    request: () => ({ model: "grok-imagine-video", prompt: "Give the woman a silver necklace", video: { url: "https://example.com/source.mp4" } }),
+    response: { request_id: "video_edit_example" },
+  },
+  "video/extensions": {
+    key: "video/extensions", category: "Video", title: "Video extensions", method: "POST", path: "/videos/extensions",
+    descriptionKey: "docs.endpointVideoExtend", capabilities: ["video"],
+    fields: [
+      { name: "model", required: true, descriptionKey: "docs.reference.fieldModel" },
+      { name: "prompt", required: true, descriptionKey: "docs.reference.fieldVideoExtendPrompt" },
+      { name: "video", required: true, descriptionKey: "docs.reference.fieldVideoInput" },
+      { name: "duration", descriptionKey: "docs.reference.fieldVideoExtendDuration" },
+    ],
+    noteKeys: ["docs.reference.noteVideoAsync", "docs.reference.noteVideoEditModel", "docs.reference.noteVideoBilling", "docs.reference.noteVideoStrict"],
+    request: () => ({ model: "grok-imagine-video", prompt: "The shot pans to an over the shoulder perspective.", duration: 6, video: { url: "https://example.com/source.mp4" } }),
+    response: { request_id: "video_extend_example" },
   },
   "video/get": {
     key: "video/get", category: "Video", title: "Get video", method: "GET", path: "/videos/{request_id}",
@@ -154,9 +182,53 @@ const endpoints: Record<string, EndpointDefinition> = {
       { name: "speed", descriptionKey: "docs.reference.fieldTTSSpeed" },
       { name: "with_timestamps", descriptionKey: "docs.reference.fieldTTSTimestamps" },
     ],
-    noteKeys: ["docs.reference.noteTTSModels", "docs.reference.noteTTSStream", "docs.reference.noteTTSBinary"],
+    noteKeys: ["docs.reference.noteTTSModels", "docs.reference.noteTTSBinary", "docs.reference.noteVoiceBilling"],
     request: (model) => ({ model, text: "Hello from Grok voice.", voice_id: "eve", language: "en", output_format: { codec: "mp3" } }),
     response: { content_type: "audio/mpeg", note: "Default responses return raw audio bytes. with_timestamps=true returns a JSON envelope." },
+  },
+  "voice/audio-speech": {
+    key: "voice/audio-speech", category: "Voice", title: "OpenAI speech", method: "POST", path: "/audio/speech",
+    descriptionKey: "docs.endpointAudioSpeech", capabilities: ["tts"],
+    fields: [
+      { name: "model", descriptionKey: "docs.reference.fieldVoiceModel" },
+      { name: "input", required: true, descriptionKey: "docs.reference.fieldAudioInput" },
+      { name: "voice", descriptionKey: "docs.reference.fieldAudioVoice" },
+      { name: "response_format", descriptionKey: "docs.reference.fieldAudioResponseFormat" },
+      { name: "speed", descriptionKey: "docs.reference.fieldTTSSpeed" },
+      { name: "language", descriptionKey: "docs.reference.fieldVoiceLanguageOptional" },
+    ],
+    noteKeys: ["docs.reference.noteAudioSpeechCompat", "docs.reference.noteTTSModels", "docs.reference.noteTTSBinary", "docs.reference.noteVoiceBilling"],
+    request: (model) => ({ model, input: "Hello from Grok voice.", voice: "alloy", response_format: "mp3", speed: 1.0, language: "en" }),
+    response: { content_type: "audio/mpeg", note: "Returns raw audio bytes compatible with OpenAI speech clients." },
+  },
+  "voice/audio-tasks": {
+    key: "voice/audio-tasks", category: "Voice", title: "OpenAI audio tasks", method: "POST", path: "/audio/tasks",
+    descriptionKey: "docs.endpointAudioTasks", capabilities: ["tts"],
+    fields: [
+      { name: "model", descriptionKey: "docs.reference.fieldVoiceModel" },
+      { name: "input", required: true, descriptionKey: "docs.reference.fieldAudioInput" },
+      { name: "voice", descriptionKey: "docs.reference.fieldAudioVoice" },
+      { name: "response_format", descriptionKey: "docs.reference.fieldAudioResponseFormat" },
+      { name: "speed", descriptionKey: "docs.reference.fieldTTSSpeed" },
+      { name: "language", descriptionKey: "docs.reference.fieldVoiceLanguageOptional" },
+    ],
+    noteKeys: ["docs.reference.noteAudioTasksCompat", "docs.reference.noteTTSModels", "docs.reference.noteVoiceBilling"],
+    request: (model) => ({ model, input: "Hello from Grok voice.", voice: "alloy", response_format: "mp3", language: "en" }),
+    response: { content_type: "audio/mpeg", note: "Compatibility path that returns raw audio bytes by default." },
+  },
+  "voice/audio-transcriptions": {
+    key: "voice/audio-transcriptions", category: "Voice", title: "OpenAI transcriptions", method: "POST", path: "/audio/transcriptions",
+    descriptionKey: "docs.endpointAudioTranscriptions", capabilities: ["stt"],
+    fields: [
+      { name: "model", descriptionKey: "docs.reference.fieldSTTModel" },
+      { name: "file", descriptionKey: "docs.reference.fieldSTTFile" },
+      { name: "url", descriptionKey: "docs.reference.fieldSTTUrl" },
+      { name: "language", descriptionKey: "docs.reference.fieldVoiceLanguage" },
+      { name: "response_format", descriptionKey: "docs.reference.fieldSTTResponseFormat" },
+    ],
+    noteKeys: ["docs.reference.noteAudioTranscriptionsCompat", "docs.reference.noteSTTInput", "docs.reference.noteSTTModels", "docs.reference.noteVoiceBilling"],
+    request: (model) => ({ model, url: "https://example.com/sample.wav", language: "en" }),
+    response: { text: "Hello from Grok voice." },
   },
   "voice/voices": {
     key: "voice/voices", category: "Voice", title: "List voices", method: "GET", path: "/tts/voices",
@@ -164,7 +236,7 @@ const endpoints: Record<string, EndpointDefinition> = {
     fields: [
       { name: "model", descriptionKey: "docs.reference.fieldVoiceModelQuery" },
     ],
-    noteKeys: ["docs.reference.noteTTSVoices", "docs.reference.noteCustomVoices"],
+    noteKeys: ["docs.reference.noteTTSVoices"],
     request: () => undefined,
     response: { voices: [{ voice_id: "eve", name: "Eve", language: "en" }, { voice_id: "ara", name: "Ara", language: "en" }] },
   },
@@ -180,21 +252,9 @@ const endpoints: Record<string, EndpointDefinition> = {
       { name: "diarize", descriptionKey: "docs.reference.fieldSTTDiarize" },
       { name: "keyterm", descriptionKey: "docs.reference.fieldSTTKeyterm" },
     ],
-    noteKeys: ["docs.reference.noteSTTInput", "docs.reference.noteSTTStream", "docs.reference.noteSTTModels"],
+    noteKeys: ["docs.reference.noteSTTInput", "docs.reference.noteSTTStream", "docs.reference.noteSTTModels", "docs.reference.noteVoiceBilling"],
     request: (model) => ({ model, url: "https://example.com/sample.wav", language: "en", format: true }),
     response: { text: "Hello from Grok voice.", language: "en", duration: 1.84, words: [{ text: "Hello", start: 0.0, end: 0.42 }] },
-  },
-  "voice/realtime-secrets": {
-    key: "voice/realtime-secrets", category: "Voice", title: "Realtime client secrets", method: "POST", path: "/realtime/client_secrets",
-    descriptionKey: "docs.endpointRealtimeSecrets", capabilities: ["realtime"],
-    fields: [
-      { name: "model", descriptionKey: "docs.reference.fieldRealtimeModel" },
-      { name: "expires_after", descriptionKey: "docs.reference.fieldRealtimeExpires" },
-      { name: "session", descriptionKey: "docs.reference.fieldRealtimeSession" },
-    ],
-    noteKeys: ["docs.reference.noteRealtimeSecret", "docs.reference.noteRealtimeProxy"],
-    request: (model) => ({ model, expires_after: { seconds: 600 }, session: { model } }),
-    response: { value: "xai-client-secret_example", expires_at: 1783860600 },
   },
   "voice/realtime": {
     key: "voice/realtime", category: "Voice", title: "Realtime websocket", method: "GET", path: "/realtime",
@@ -203,25 +263,9 @@ const endpoints: Record<string, EndpointDefinition> = {
       { name: "model", descriptionKey: "docs.reference.fieldRealtimeModelQuery" },
       { name: "Upgrade", required: true, descriptionKey: "docs.reference.fieldWSUpgrade" },
     ],
-    noteKeys: ["docs.reference.noteRealtimeEvents", "docs.reference.noteRealtimeProxy", "docs.reference.noteRealtimeAuth"],
+    noteKeys: ["docs.reference.noteRealtimeEvents", "docs.reference.noteRealtimeProxy", "docs.reference.noteRealtimeAuth", "docs.reference.noteVoiceBilling"],
     request: () => undefined,
     response: { type: "session.created", session: { model: "grok-voice-latest" } },
-  },
-  "voice/custom-voices": {
-    key: "voice/custom-voices", category: "Voice", title: "Custom voices", method: "POST", path: "/custom-voices",
-    descriptionKey: "docs.endpointCustomVoices", capabilities: ["tts"],
-    fields: [
-      { name: "name", required: true, descriptionKey: "docs.reference.fieldCustomVoiceName" },
-      { name: "file", required: true, descriptionKey: "docs.reference.fieldCustomVoiceFile" },
-      { name: "language", descriptionKey: "docs.reference.fieldVoiceLanguage" },
-      { name: "gender", descriptionKey: "docs.reference.fieldCustomVoiceGender" },
-      { name: "tone", descriptionKey: "docs.reference.fieldCustomVoiceTone" },
-      { name: "use_case", descriptionKey: "docs.reference.fieldCustomVoiceUseCase" },
-      { name: "model", descriptionKey: "docs.reference.fieldVoiceModel" },
-    ],
-    noteKeys: ["docs.reference.noteCustomVoices", "docs.reference.noteCustomVoiceManage"],
-    request: (model) => ({ model, name: "Studio Narrator", language: "en", tone: "warm" }),
-    response: { voice_id: "custom_voice_example", name: "Studio Narrator", language: "en", tone: "warm" },
   },
 };
 
@@ -314,10 +358,10 @@ function withExampleModel(response: Record<string, unknown>, model: string): Rec
 }
 
 function fallbackModel(key: string): string {
-  if (key.startsWith("image/")) return key === "image/edits" ? "grok-imagine-image-edit" : "grok-imagine-image-2.0";
+  if (key.startsWith("image/")) return key === "image/edits" ? "grok-imagine-image-edit" : "grok-imagine-image-lite";
   if (key.startsWith("video/")) return "grok-imagine-video";
   if (key.startsWith("voice/")) {
-    if (key === "voice/stt") return "grok-stt";
+    if (key === "voice/stt" || key === "voice/audio-transcriptions") return "grok-stt";
     return "grok-voice-latest";
   }
   return "your-enabled-model";

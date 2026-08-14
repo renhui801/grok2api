@@ -1,9 +1,11 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -185,6 +187,8 @@ func (s *Service) executeImage(
 	var response *provider.Response
 	var lastCredentialFailure *accountdomain.Credential
 	var lastCredentialError error
+	var lastTeamLimitedResponse *provider.Response
+	var lastTeamLimitedCredential accountdomain.Credential
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
 		if selection == nil {
 			selection, err = s.selector.beginSelectionSessionForKey(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", excluded, false, key.AccountScope())
@@ -193,6 +197,12 @@ func (s *Service) executeImage(
 			lease, err = selection.Acquire(ctx, excluded, false)
 		}
 		if err != nil {
+			if lastTeamLimitedResponse != nil {
+				response = lastTeamLimitedResponse
+				credential = lastTeamLimitedCredential
+				lease = nil
+				break
+			}
 			errorCode := "upstream_unavailable"
 			var selectionFailure *SelectionUnavailableError
 			if errors.As(err, &selectionFailure) {
@@ -202,6 +212,11 @@ func (s *Service) executeImage(
 			return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, err)
 		}
 		excluded[lease.Credential.ID] = true
+		if limited, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
+			lease.Release()
+			attempt--
+			continue
+		}
 		credential, err = s.accounts.EnsureCredential(ctx, lease.Credential, false)
 		if err != nil {
 			s.logger.Error("image_credential_failed", "event_id", eventID, "request_id", requestID, "model", externalModel, "provider", route.Provider, "account_id", lease.Credential.ID, "error", err)
@@ -253,14 +268,40 @@ func (s *Service) executeImage(
 			lease.Release()
 			continue
 		}
-		if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow && response.StatusCode == http.StatusTooManyRequests && lease.QuotaMode != "" {
+		if response.StatusCode == http.StatusTooManyRequests {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
-			exhausted, reconcileErr := s.accounts.ReconcileWebRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-			s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
-			if reconcileErr != nil || !exhausted {
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+			if response.RateLimit == nil {
+				body, _ := readRetryableBody(response.Body)
+				if metadata := provider.ParseRateLimitMetadata(body); metadata != nil {
+					response.RateLimit = metadata
+					if retryAfter <= 0 && metadata.RetryAfter > 0 {
+						retryAfter = metadata.RetryAfter
+					}
+				}
+				response.Body = io.NopCloser(bytes.NewReader(body))
 			}
-			if attemptPolicy.hasNext(attempt) {
+			if _, ok := s.recordTeamModelRateLimitFromResponse(credential, route.UpstreamModel, response); ok && attemptPolicy.hasNext(attempt) {
+				body, _ := readRetryableBody(response.Body)
+				response.Body = io.NopCloser(bytes.NewReader(body))
+				lastTeamLimitedResponse = response
+				lastTeamLimitedCredential = credential
+				lease.Release()
+				continue
+			}
+			quotaKind, _ := s.providers.QuotaKind(credential.Provider)
+			if quotaKind == provider.QuotaRemoteWindow && lease.QuotaMode != "" {
+				exhausted, reconcileErr := s.accounts.ReconcileWebRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
+				s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
+				if reconcileErr != nil || !exhausted {
+					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				}
+				if attemptPolicy.hasNext(attempt) {
+					_, _ = readRetryableBody(response.Body)
+					lease.Release()
+					continue
+				}
+			} else if isRetryableResponse(response, route.Provider) && attemptPolicy.hasNext(attempt) {
+				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
 				_, _ = readRetryableBody(response.Body)
 				lease.Release()
 				continue
@@ -275,14 +316,19 @@ func (s *Service) executeImage(
 		}
 		return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, lastCredentialError)
 	}
-	effectiveQuotaMode := lease.QuotaMode
+	effectiveQuotaMode := ""
+	if lease != nil {
+		effectiveQuotaMode = lease.QuotaMode
+	}
 	accountID := credential.ID
 	var once sync.Once
 	finalize := func(_ Usage, _ string, errorCode string) {
 		once.Do(func() {
 			successful := auditRequestSucceeded(response.StatusCode, errorCode)
-			lease.completeSelectorObservation(successful)
-			lease.Release()
+			if lease != nil {
+				lease.completeSelectorObservation(successful)
+				lease.Release()
+			}
 			budget := newFinalizationBudget(string(operation), string(route.Provider))
 			record := auditBase
 			record.AccountID, record.AccountName, record.StatusCode = &accountID, credential.Name, response.StatusCode

@@ -1438,6 +1438,92 @@ func TestGenerateImageUnlimitedAttemptsRetainsEgressRetry(t *testing.T) {
 	}
 }
 
+func TestGenerateImageTeamRateLimitSkipsSameTeam(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "image-team-rate-limit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	credentials := make([]account.Credential, 0, 3)
+	for index, seed := range []struct {
+		name   string
+		teamID string
+	}{{"image-team-a-first", "00000000-0000-0000-0000-000000000014"}, {"image-team-a-second", "00000000-0000-0000-0000-000000000014"}, {"image-team-b", "00000000-0000-0000-0000-000000000015"}} {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, Name: seed.name, SourceKey: seed.name, TeamID: seed.teamID,
+			EncryptedAccessToken: "encrypted-" + seed.name, Enabled: true, AuthStatus: account.AuthStatusActive,
+			Priority: 300 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	const model = "grok-imagine-image-quality"
+	if err := modelRepo.UpsertRoutes(ctx, []modeldomain.Route{{
+		PublicID: model, Provider: account.ProviderConsole, UpstreamModel: model,
+		Capability: modeldomain.CapabilityImage, Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{model}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "image-team-key", Prefix: "imageteam", SecretHash: strings.Repeat("a", 64), EncryptedSecret: "encrypted-key",
+		Enabled: true, RPMLimit: 60, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &teamModelRateLimitImageAdapter{rateLimitedTeam: "00000000-0000-0000-0000-000000000014"}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+
+	result, err := service.GenerateImage(ctx, ImageGenerationInput{
+		RequestID: "req-image-team-first", ClientKey: key, PublicModel: model,
+		Prompt: "test", Count: 1, ResponseFormat: "url",
+	})
+	if err != nil || result == nil || result.StatusCode != http.StatusOK {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+	_, _ = io.ReadAll(result.Body)
+	result.Finalize(Usage{}, "", "")
+	_ = result.Body.Close()
+	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0] != credentials[0].ID || attempts[1] != credentials[2].ID {
+		t.Fatalf("image team 429 must skip same-team B and use team C, attempts=%#v", attempts)
+	}
+
+	result, err = service.GenerateImage(ctx, ImageGenerationInput{
+		RequestID: "req-image-team-cached", ClientKey: key, PublicModel: model,
+		Prompt: "again", Count: 1, ResponseFormat: "url",
+	})
+	if err != nil || result == nil || result.StatusCode != http.StatusOK {
+		t.Fatalf("cached result = %#v, err = %v", result, err)
+	}
+	_, _ = io.ReadAll(result.Body)
+	result.Finalize(Usage{}, "", "")
+	_ = result.Body.Close()
+	if attempts := adapter.Attempts(); len(attempts) != 3 || attempts[2] != credentials[2].ID {
+		t.Fatalf("cached Team A limit should go straight to Team B account, attempts=%#v", attempts)
+	}
+}
+
 func TestGatewayDoesNotPersistStatelessConsoleResponses(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "console-stateless.db"))
@@ -2720,6 +2806,46 @@ func (a *teamModelRateLimitConsoleAdapter) Attempts() []teamModelRateLimitConsol
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]teamModelRateLimitConsoleAttempt(nil), a.attempts...)
+}
+
+type teamModelRateLimitImageAdapter struct {
+	mu              sync.Mutex
+	attempts        []uint64
+	rateLimitedTeam string
+}
+
+func (a *teamModelRateLimitImageAdapter) Provider() account.Provider {
+	return account.ProviderConsole
+}
+func (a *teamModelRateLimitImageAdapter) Definition() provider.Definition {
+	definition := testConversationDefinition(account.ProviderConsole)
+	definition.Media.ImageGeneration = true
+	return definition
+}
+func (a *teamModelRateLimitImageAdapter) GenerateImage(_ context.Context, request provider.ImageGenerationRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	a.mu.Unlock()
+	if request.Credential.TeamID != a.rateLimitedTeam {
+		return &provider.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"data":[{"url":"https://example.com/ok.png"}]}`)),
+		}, nil
+	}
+	return &provider.Response{
+		StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests",
+		Header: http.Header{"Content-Type": {"application/json"}, "X-Should-Retry": {"false"}},
+		Body:   io.NopCloser(strings.NewReader(`{"code":"resource-exhausted","error":"Too many requests for team ` + request.Credential.TeamID + ` and model grok-imagine-image-quality. Requests per Second (actual/limit): 2/2."}`)),
+		RateLimit: &provider.RateLimitMetadata{
+			Scope: provider.RateLimitScopeRPS, TeamID: request.Credential.TeamID, Model: request.Model,
+			Actual: 2, Limit: 2, RetryAfter: 2 * time.Second,
+		},
+	}, nil
+}
+func (a *teamModelRateLimitImageAdapter) Attempts() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]uint64(nil), a.attempts...)
 }
 
 func TestGatewaySafetyRejectionDoesNotTouchAccountState(t *testing.T) {

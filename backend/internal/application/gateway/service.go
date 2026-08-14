@@ -437,6 +437,24 @@ func (s *Service) markTeamModelRateLimit(credential accountdomain.Credential, up
 	return value
 }
 
+func (s *Service) recordTeamModelRateLimitFromResponse(credential accountdomain.Credential, upstreamModel string, response *provider.Response) (teamModelRateLimit, bool) {
+	if response == nil || response.StatusCode != http.StatusTooManyRequests || response.RateLimit == nil {
+		return teamModelRateLimit{}, false
+	}
+	metadata := *response.RateLimit
+	if strings.TrimSpace(metadata.TeamID) == "" {
+		metadata.TeamID = strings.TrimSpace(credential.TeamID)
+	}
+	if metadata.TeamID == "" {
+		return teamModelRateLimit{}, false
+	}
+	limited := s.markTeamModelRateLimit(credential, upstreamModel, metadata, time.Now().UTC())
+	if s.logger != nil {
+		s.logger.Warn("upstream_team_model_rate_limited", "provider", credential.Provider, "model", upstreamModel, "team_fingerprint", limited.TeamFingerprint, "scope", metadata.Scope, "actual", metadata.Actual, "limit", metadata.Limit, "retry_after", time.Until(limited.Until))
+	}
+	return limited, true
+}
+
 func (s *Service) SetLogger(logger *slog.Logger) {
 	if logger != nil {
 		s.logger = logger

@@ -333,11 +333,10 @@ func TestBuildRateLimitForcesAccountFailoverDespiteRetryVeto(t *testing.T) {
 		Header:     http.Header{"X-Should-Retry": {"false"}},
 		Body:       io.NopCloser(strings.NewReader(`{"code":"subscription:free-usage-exhausted"}`)),
 	}
-	if !isRetryableResponse(response, accountdomain.ProviderBuild) {
-		t.Fatal("Build free-usage 429 must force account rotation even when X-Should-Retry is false")
-	}
-	if isRetryableResponse(response, accountdomain.ProviderWeb) {
-		t.Fatal("non-Build 429 must continue honoring X-Should-Retry:false")
+	for _, providerValue := range []accountdomain.Provider{accountdomain.ProviderBuild, accountdomain.ProviderWeb, accountdomain.ProviderConsole} {
+		if !isRetryableResponse(response, providerValue) {
+			t.Fatalf("%s 429 must force account rotation even when X-Should-Retry is false", providerValue)
+		}
 	}
 }
 

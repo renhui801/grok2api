@@ -212,7 +212,7 @@ func (s *Service) executeImage(
 			return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, err)
 		}
 		excluded[lease.Credential.ID] = true
-		if limited, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
+		if _, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
 			lease.Release()
 			attempt--
 			continue

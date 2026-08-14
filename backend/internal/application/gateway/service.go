@@ -44,7 +44,6 @@ var (
 	ErrConversationUnsupported    = errors.New("目标模型不支持当前对话协议")
 	ErrVideoInputTooLarge         = errors.New("视频参考图片编码后总输入超过 32 MiB")
 	ErrVideoInputUnavailable      = errors.New("视频临时输入不存在或已过期")
-	ErrVideoOperationUnsupported  = errors.New("视频编辑/延长仅支持路由到 Console grok-imagine-video")
 	ErrLedgerUnavailable          = errors.New("计费账本暂不可用")
 )
 
@@ -161,8 +160,8 @@ type routeResolver interface {
 type videoAssetStore interface {
 	SaveVideo(ctx context.Context, jobID, contentType string, body io.Reader) (mediadomain.Asset, error)
 	OpenVideo(ctx context.Context, id string) (mediadomain.Asset, io.ReadCloser, error)
-	OpenInputAsset(ctx context.Context, id string) (mediadomain.Asset, io.ReadCloser, error)
-	ReleaseInputAssets(ctx context.Context, references []string) error
+	OpenInputImage(ctx context.Context, id string) (mediadomain.Asset, io.ReadCloser, error)
+	ReleaseInputImages(ctx context.Context, references []string) error
 }
 
 type accountModelSyncer interface {
@@ -179,7 +178,6 @@ type Service struct {
 	selector                    *Selector
 	responses                   repository.ResponseRepository
 	maxAttempts                 atomic.Int64
-	videoMaxAttempts            atomic.Int64
 	buildForbiddenReauth        atomic.Pointer[buildForbiddenReauthPolicy]
 	requestTimeout              atomic.Int64
 	mediaJobs                   repository.MediaJobRepository
@@ -445,10 +443,6 @@ func (s *Service) SetLogger(logger *slog.Logger) {
 
 func (s *Service) UpdateMaxAttempts(maxAttempts int) { s.maxAttempts.Store(int64(maxAttempts)) }
 
-// UpdateVideoMaxAttempts configures create-phase account failover for video jobs.
-// 0 is treated as the general default pool size for legacy configs.
-func (s *Service) UpdateVideoMaxAttempts(maxAttempts int) { s.videoMaxAttempts.Store(int64(maxAttempts)) }
-
 // UpdateMarkBuildChatDeniedAsReauth 热更新 Build chat 永久拒绝是否标 reauthRequired。
 // 默认 false：仅模型级冷却；true 时按旧逻辑将账号标为失效并出池。
 func (s *Service) UpdateMarkBuildChatDeniedAsReauth(enabled bool) {
@@ -692,19 +686,10 @@ func routeTargetSeed(input Input) string {
 
 // selectMediaRoute selects a same-name route that satisfies media capability, key permissions, and Provider support.
 func (s *Service) selectMediaRoute(routes []modeldomain.Route, key clientkey.Key, capability modeldomain.Capability, providerSupported func(accountdomain.Provider) bool) (modeldomain.Route, error) {
-	eligible, fallback, err := s.eligibleMediaRoutes(routes, key, capability, providerSupported)
-	if err != nil {
-		return fallback, err
-	}
-	return eligible[0], nil
-}
-
-func (s *Service) eligibleMediaRoutes(routes []modeldomain.Route, key clientkey.Key, capability modeldomain.Capability, providerSupported func(accountdomain.Provider) bool) ([]modeldomain.Route, modeldomain.Route, error) {
 	if len(routes) == 0 {
-		return nil, modeldomain.Route{}, ErrModelNotFound
+		return modeldomain.Route{}, ErrModelNotFound
 	}
 	fallback := routes[0]
-	eligible := make([]modeldomain.Route, 0, len(routes))
 	accountScope := key.AccountScope()
 	capabilityMatched := false
 	scopeMatched := false
@@ -724,68 +709,19 @@ func (s *Service) eligibleMediaRoutes(routes []modeldomain.Route, key clientkey.
 		}
 		allowed = true
 		if providerSupported(route.Provider) {
-			eligible = append(eligible, route)
+			return route, nil
 		}
-	}
-	if len(eligible) > 0 {
-		return eligible, fallback, nil
 	}
 	if !capabilityMatched {
-		return nil, fallback, ErrModelNotFound
+		return fallback, ErrModelNotFound
 	}
 	if !scopeMatched {
-		return nil, fallback, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
+		return fallback, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
 	}
 	if !allowed {
-		return nil, fallback, clientkeyapp.ErrModelNotAllowed
+		return fallback, clientkeyapp.ErrModelNotAllowed
 	}
-	return nil, fallback, ErrNoAvailableAccount
-}
-
-// selectSchedulableMediaRoute resolves a concrete same-name media target and
-// its immutable account plan together. A cooling or exhausted first target
-// therefore cannot hide a healthy target from another Provider.
-func (s *Service) selectSchedulableMediaRoute(ctx context.Context, routes []modeldomain.Route, key clientkey.Key, capability modeldomain.Capability, consumesQuota bool, providerSupported func(accountdomain.Provider) bool) (modeldomain.Route, *selectionSession, error) {
-	return s.selectSchedulableMediaRouteWithQuotaMode(ctx, routes, key, capability, consumesQuota, providerSupported, nil)
-}
-
-func (s *Service) selectSchedulableMediaRouteWithQuotaMode(ctx context.Context, routes []modeldomain.Route, key clientkey.Key, capability modeldomain.Capability, consumesQuota bool, providerSupported func(accountdomain.Provider) bool, resolveQuotaMode func(modeldomain.Route) string) (modeldomain.Route, *selectionSession, error) {
-	eligible, fallback, err := s.eligibleMediaRoutes(routes, key, capability, providerSupported)
-	if err != nil {
-		return fallback, nil, err
-	}
-	var firstSelectionErr error
-	for _, route := range eligible {
-		quotaMode := ""
-		if consumesQuota {
-			if resolveQuotaMode != nil {
-				quotaMode = resolveQuotaMode(route)
-			} else {
-				quotaMode = s.providers.QuotaMode(route.Provider, route.UpstreamModel)
-			}
-		}
-		session, selectionErr := s.selector.beginSelectionSessionForKey(
-			ctx,
-			route.Provider,
-			route.ID,
-			route.UpstreamModel,
-			quotaMode,
-			"",
-			nil,
-			false,
-			key.AccountScope(),
-		)
-		if selectionErr == nil {
-			return route, session, nil
-		}
-		if firstSelectionErr == nil {
-			firstSelectionErr = selectionErr
-		}
-	}
-	if firstSelectionErr == nil {
-		firstSelectionErr = ErrNoAvailableAccount
-	}
-	return eligible[0], nil, firstSelectionErr
+	return fallback, ErrNoAvailableAccount
 }
 
 func (s *Service) createResponseAt(ctx context.Context, input Input, path string) (*Result, error) {
@@ -1206,7 +1142,11 @@ attemptLoop:
 				}
 			}
 			buildForbiddenReauth := credential.Provider == accountdomain.ProviderBuild && s.shouldInvalidateBuildForbidden(lastFailure)
-			if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil && response.RateLimit.Model == route.UpstreamModel {
+			// Team RPS/RPM 429 is shared by every credential in that team. Shield the
+			// requested upstream model even when xAI reports an aliased model id
+			// (for example grok-4.5 vs grok-4.5-build-free); requiring an exact
+			// match used to fall through to per-account cooldown and freeze the pool.
+			if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil {
 				rateLimitMeta := *response.RateLimit
 				if strings.TrimSpace(rateLimitMeta.TeamID) == "" {
 					rateLimitMeta.TeamID = strings.TrimSpace(credential.TeamID)
@@ -1358,7 +1298,7 @@ attemptLoop:
 				record.ReasoningTokens = usage.ReasoningTokens
 				record.TotalTokens = usage.TotalTokens
 				record.CostInUSDTicks = usage.CostInUSDTicks
-				imagePricing, imagePriced := audit.EstimateOfficialImageCost(pricingModel, "", "", response.QuotaUnits)
+				imagePricing, imagePriced := audit.EstimateOfficialImageCost(pricingModel, "", response.QuotaUnits)
 				if imagePriced {
 					record.MediaOutputImages = int64(max(0, response.QuotaUnits))
 				}
@@ -1806,7 +1746,7 @@ func isRetryableResponse(response *provider.Response, upstreamProvider accountdo
 	if response == nil || !isRetryable(response.StatusCode) {
 		return false
 	}
-	// Account-scoped payment failures must always rotate accounts.
+	// Account-scoped 429 always rotates. Build 402/403 also rotate.
 	// Upstream X-Should-Retry:false is only honored for non-account errors (e.g. 5xx history).
 	if forcesAccountFailover(response.StatusCode, upstreamProvider) {
 		return true
@@ -1829,13 +1769,18 @@ func isTerminalRequestForbidden(upstreamProvider accountdomain.Provider, failure
 		(upstreamProvider == accountdomain.ProviderConsole && failure.RequestScopedForbidden && isDPoPProofRequired(failure.UpstreamCode))
 }
 
-// forcesAccountFailover keeps Build account-scoped billing, permission, and rate-limit
+// forcesAccountFailover keeps account-scoped billing, permission, and rate-limit
 // failures on the account-rotation path so their state can be recorded before another
-// account is selected. free-usage 429 and Team RPS 429 both need rotation even when
-// upstream sets X-Should-Retry:false.
+// account is selected. 429 is always rotated: free-usage, Team RPS/RPM, and ordinary
+// per-account limits are credential-scoped, even when upstream sets X-Should-Retry:false.
+// Build 402/403 stay on this path for the same reason; Web/Console 403 keep their
+// egress/clearance recovery and still honor the retry veto.
 func forcesAccountFailover(status int, upstreamProvider accountdomain.Provider) bool {
+	if status == http.StatusTooManyRequests {
+		return true
+	}
 	return upstreamProvider == accountdomain.ProviderBuild &&
-		(status == http.StatusPaymentRequired || status == http.StatusForbidden || status == http.StatusTooManyRequests)
+		(status == http.StatusPaymentRequired || status == http.StatusForbidden)
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {

@@ -189,7 +189,6 @@ func (s *Service) executeImage(
 	var lastCredentialError error
 	var lastTeamLimitedResponse *provider.Response
 	var lastTeamLimitedCredential accountdomain.Credential
-	var lastTeamLimitedUntil time.Time
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
 		if selection == nil {
 			selection, err = s.selector.beginSelectionSessionForKey(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", excluded, false, key.AccountScope())
@@ -199,17 +198,6 @@ func (s *Service) executeImage(
 		}
 		if err != nil {
 			if lastTeamLimitedResponse != nil {
-				wait, canWait := teamRateLimitRetryWait(lastTeamLimitedUntil, time.Now().UTC())
-				if canWait && attemptPolicy.hasNext(attempt) {
-					excluded = make(map[uint64]bool)
-					if selection != nil {
-						selection.RetryAccount(lastTeamLimitedCredential.ID)
-					}
-					if waitErr := waitForDuration(ctx, wait); waitErr == nil {
-						err = nil
-						continue
-					}
-				}
 				response = lastTeamLimitedResponse
 				credential = lastTeamLimitedCredential
 				lease = nil
@@ -224,26 +212,8 @@ func (s *Service) executeImage(
 			return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, err)
 		}
 		excluded[lease.Credential.ID] = true
-		if limited, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
+		if _, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
 			lease.Release()
-			wait, canWait := teamRateLimitRetryWait(limited.Until, time.Now().UTC())
-			if strings.TrimSpace(lease.Credential.TeamID) == "" && canWait {
-				delete(excluded, lease.Credential.ID)
-				if selection != nil {
-					selection.RetryAccount(lease.Credential.ID)
-				}
-				if waitErr := waitForDuration(ctx, wait); waitErr != nil {
-					if lastTeamLimitedResponse != nil {
-						response = lastTeamLimitedResponse
-						credential = lastTeamLimitedCredential
-						lease = nil
-						break
-					}
-					writeFailureAudit(http.StatusTooManyRequests, "upstream_rate_limited", &lease.Credential)
-					return nil, waitErr
-				}
-				continue
-			}
 			attempt--
 			continue
 		}
@@ -310,25 +280,12 @@ func (s *Service) executeImage(
 				}
 				response.Body = io.NopCloser(bytes.NewReader(body))
 			}
-			if limited, ok := s.recordTeamModelRateLimitFromResponse(credential, route.UpstreamModel, response); ok && attemptPolicy.hasNext(attempt) {
+			if _, ok := s.recordTeamModelRateLimitFromResponse(credential, route.UpstreamModel, response); ok && attemptPolicy.hasNext(attempt) {
 				body, _ := readRetryableBody(response.Body)
 				response.Body = io.NopCloser(bytes.NewReader(body))
 				lastTeamLimitedResponse = response
 				lastTeamLimitedCredential = credential
-				lastTeamLimitedUntil = limited.Until
 				lease.Release()
-				wait, canWait := teamRateLimitRetryWait(limited.Until, time.Now().UTC())
-				if strings.TrimSpace(credential.TeamID) == "" && canWait {
-					delete(excluded, credential.ID)
-					if selection != nil {
-						selection.RetryAccount(credential.ID)
-					}
-					s.logger.Warn("upstream_team_model_rate_limit_wait", "event_id", eventID, "request_id", requestID, "provider", route.Provider, "model", route.UpstreamModel, "account_id", credential.ID, "wait", wait)
-					if waitErr := waitForDuration(ctx, wait); waitErr != nil {
-						break
-					}
-					continue
-				}
 				continue
 			}
 			quotaKind, _ := s.providers.QuotaKind(credential.Provider)
